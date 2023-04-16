@@ -1,38 +1,28 @@
 import audioBufferToWav from 'audiobuffer-to-wav';
-import aes from 'crypto-js/aes';
-import sha256 from 'crypto-js/sha256';
-import utf8 from 'crypto-js/enc-utf8';
-
 import {initStorage, migrateLegacyStorage} from 'storage/init';
-import {isStorageReady} from 'storage/storage';
-import storage from 'storage/storage';
+import storage, {isStorageReady} from 'storage/storage';
 import {
-  showNotification,
-  sendNativeMessage,
+  processAppUse,
   processMessageResponse,
-  processAppUse
+  sendNativeMessage,
+  showNotification
 } from 'utils/app';
 import {
+  arrayBufferToBase64,
   executeCode,
-  scriptsAllowed,
   getBrowser,
   getPlatform,
-  getRandomInt,
-  arrayBufferToBase64,
   normalizeAudio,
+  scriptsAllowed,
   sliceAudio
 } from 'utils/common';
+import {clientAppVersion, targetEnv} from 'utils/config';
 import {
-  recaptchaChallengeUrlRx,
   captchaGoogleSpeechApiLangCodes,
-  captchaIbmSpeechApiLangCodes,
-  captchaMicrosoftSpeechApiLangCodes,
-  captchaWitSpeechApiLangCodes
+  recaptchaChallengeUrlRx
 } from 'utils/data';
-import {targetEnv, clientAppVersion} from 'utils/config';
 
 let nativePort;
-let secrets;
 
 function getFrameClientPos(index) {
   let currentIndex = -1;
@@ -255,73 +245,6 @@ async function prepareAudio(audio) {
   return audioBufferToWav(audioSlice);
 }
 
-async function loadSecrets() {
-  try {
-    const ciphertext = await (await fetch('/secrets.txt')).text();
-
-    const key = sha256(
-      (await (await fetch('/src/background/script.js')).text()) +
-        (await (await fetch('/src/solve/script.js')).text())
-    ).toString();
-
-    secrets = JSON.parse(aes.decrypt(ciphertext, key).toString(utf8));
-  } catch (err) {
-    secrets = {};
-    const {speechService} = await storage.get('speechService');
-    if (speechService === 'witSpeechApiDemo') {
-      await storage.set({speechService: 'witSpeechApi'});
-    }
-  }
-}
-
-async function getWitSpeechApiKey(speechService, language) {
-  if (speechService === 'witSpeechApiDemo') {
-    if (!secrets) {
-      await loadSecrets();
-    }
-    const apiKeys = secrets.witApiKeys;
-    if (apiKeys) {
-      const apiKey = apiKeys[language];
-      if (Array.isArray(apiKey)) {
-        return apiKey[getRandomInt(1, apiKey.length) - 1];
-      }
-      return apiKey;
-    }
-  } else {
-    const {witSpeechApiKeys: apiKeys} = await storage.get('witSpeechApiKeys');
-    return apiKeys[language];
-  }
-}
-
-async function getWitSpeechApiResult(apiKey, audioContent) {
-  const result = {};
-
-  const rsp = await fetch('https://api.wit.ai/speech?v=20221114', {
-    mode: 'cors',
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + apiKey
-    },
-    body: new Blob([audioContent], {type: 'audio/wav'})
-  });
-
-  if (rsp.status !== 200) {
-    if (rsp.status === 429) {
-      result.errorId = 'error_apiQuotaExceeded';
-      result.errorTimeout = 6000;
-    } else {
-      throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
-    }
-  } else {
-    const data = JSON.parse((await rsp.text()).split('\r\n').at(-1)).text;
-    if (data) {
-      result.text = data.trim();
-    }
-  }
-
-  return result;
-}
-
 async function getGoogleSpeechApiResult(
   apiKey,
   audioContent,
@@ -364,59 +287,6 @@ async function getGoogleSpeechApiResult(
   }
 }
 
-async function getIbmSpeechApiResult(apiUrl, apiKey, audioContent, model) {
-  const rsp = await fetch(
-    `${apiUrl}/v1/recognize?model=${model}&profanity_filter=false`,
-    {
-      mode: 'cors',
-      method: 'POST',
-      headers: {
-        Authorization: 'Basic ' + window.btoa('apikey:' + apiKey),
-        'X-Watson-Learning-Opt-Out': 'true'
-      },
-      body: new Blob([audioContent], {type: 'audio/wav'})
-    }
-  );
-
-  if (rsp.status !== 200) {
-    throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
-  }
-
-  const results = (await rsp.json()).results;
-  if (results && results.length) {
-    return results[0].alternatives[0].transcript.trim();
-  }
-}
-
-async function getMicrosoftSpeechApiResult(
-  apiLocation,
-  apiKey,
-  audioContent,
-  language
-) {
-  const rsp = await fetch(
-    `https://${apiLocation}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${language}&format=detailed&profanity=raw`,
-    {
-      mode: 'cors',
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': apiKey,
-        'Content-type': 'audio/wav; codec=audio/pcm; samplerate=16000'
-      },
-      body: new Blob([audioContent], {type: 'audio/wav'})
-    }
-  );
-
-  if (rsp.status !== 200) {
-    throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
-  }
-
-  const results = (await rsp.json()).NBest;
-  if (results) {
-    return results[0].Lexical.trim();
-  }
-}
-
 async function transcribeAudio(audioUrl, lang) {
   let solution;
 
@@ -428,121 +298,15 @@ async function transcribeAudio(audioUrl, lang) {
     'tryEnglishSpeechModel'
   ]);
 
-  if (['witSpeechApiDemo', 'witSpeechApi'].includes(speechService)) {
-    const language = captchaWitSpeechApiLangCodes[lang] || 'english';
-
-    const apiKey = await getWitSpeechApiKey(speechService, language);
-
-    if (!apiKey) {
-      showNotification({messageId: 'error_missingApiKey'});
-      return;
-    }
-
-    const result = await getWitSpeechApiResult(apiKey, audioContent);
-    if (result.errorId) {
-      showNotification({
-        messageId: result.errorId,
-        timeout: result.errorTimeout
-      });
-      return;
-    }
-    solution = result.text;
-
-    if (!solution && language !== 'english' && tryEnglishSpeechModel) {
-      const apiKey = await getWitSpeechApiKey(speechService, 'english');
-
-      if (!apiKey) {
-        showNotification({messageId: 'error_missingApiKey'});
-        return;
-      }
-
-      const result = await getWitSpeechApiResult(apiKey, audioContent);
-      if (result.errorId) {
-        showNotification({
-          messageId: result.errorId,
-          timeout: result.errorTimeout
-        });
-        return;
-      }
-      solution = result.text;
-    }
-  } else if (speechService === 'googleSpeechApi') {
-    const {googleSpeechApiKey: apiKey} = await storage.get(
-      'googleSpeechApiKey'
-    );
-
-    if (!apiKey) {
-      showNotification({messageId: 'error_missingApiKey'});
-      return;
-    }
-
-    const language = captchaGoogleSpeechApiLangCodes[lang] || 'en-US';
-
-    solution = await getGoogleSpeechApiResult(
-      apiKey,
-      audioContent,
-      language,
-      tryEnglishSpeechModel
-    );
-  } else if (speechService === 'ibmSpeechApi') {
-    const {ibmSpeechApiUrl: apiUrl, ibmSpeechApiKey: apiKey} =
-      await storage.get(['ibmSpeechApiUrl', 'ibmSpeechApiKey']);
-
-    if (!apiUrl) {
-      showNotification({messageId: 'error_missingApiUrl'});
-      return;
-    }
-    if (!apiKey) {
-      showNotification({messageId: 'error_missingApiKey'});
-      return;
-    }
-
-    const model = captchaIbmSpeechApiLangCodes[lang] || 'en-US_Multimedia';
-
-    solution = await getIbmSpeechApiResult(apiUrl, apiKey, audioContent, model);
-
-    if (
-      !solution &&
-      !['en-US_Multimedia', 'en-GB_Multimedia'].includes(model) &&
-      tryEnglishSpeechModel
-    ) {
-      solution = await getIbmSpeechApiResult(
-        apiUrl,
-        apiKey,
-        audioContent,
-        'en-US_Multimedia'
-      );
-    }
-  } else if (speechService === 'microsoftSpeechApi') {
-    const {microsoftSpeechApiLoc: apiLocaction, microsoftSpeechApiKey: apiKey} =
-      await storage.get(['microsoftSpeechApiLoc', 'microsoftSpeechApiKey']);
-
-    if (!apiKey) {
-      showNotification({messageId: 'error_missingApiKey'});
-      return;
-    }
-
-    const language = captchaMicrosoftSpeechApiLangCodes[lang] || 'en-US';
-
-    solution = await getMicrosoftSpeechApiResult(
-      apiLocaction,
-      apiKey,
-      audioContent,
-      language
-    );
-    if (
-      !solution &&
-      !['en-US', 'en-GB'].includes(language) &&
-      tryEnglishSpeechModel
-    ) {
-      solution = await getMicrosoftSpeechApiResult(
-        apiLocaction,
-        apiKey,
-        audioContent,
-        'en-US'
-      );
-    }
-  }
+  // const {googleSpeechApiKey: apiKey} = await storage.get('googleSpeechApiKey');
+  const GOOGLE_API_KEY = 'CHANGE_API_KEY_HERE';
+  const language = captchaGoogleSpeechApiLangCodes[lang] || 'en-US';
+  solution = await getGoogleSpeechApiResult(
+    GOOGLE_API_KEY,
+    audioContent,
+    language,
+    tryEnglishSpeechModel
+  );
 
   if (!solution) {
     if (['witSpeechApiDemo', 'witSpeechApi'].includes(speechService)) {
